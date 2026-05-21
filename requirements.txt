@@ -1,0 +1,32 @@
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Image Processing
+Pillow>=9.5.0
+opencv-python>=4.7.0
+
+# Signal Processing
+pywavelets>=1.4.1
+
+# Data Processing
+pandas>=2.0.0
+scikit-learn>=1.2.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Configuration
+pyyaml>=6.0
+
+# Progress Bar
+tqdm>=4.65.0
+
+# Biomedical Signal Processing
+wfdb>=4.1.0
+
