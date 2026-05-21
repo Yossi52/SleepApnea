@@ -187,11 +187,3 @@ Three independent EfficientNet-B0 branches, features concatenated before classif
 ### Transformer Fusion
 Three EfficientNet-B0 branches with Transformer encoder for attention-based fusion
 
-## License
-
-MIT License
-
-## Contact
-
-For questions or issues, please open an issue on GitHub or contact [your-email@example.com]
-
