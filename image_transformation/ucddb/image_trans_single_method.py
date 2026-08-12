@@ -59,7 +59,7 @@ def create_images(signal, fs=100, target_size=(224, 224)):
     
     # Scalogram
     widths = np.geomspace(0.5, fs//2, num=1500)
-    widths = (fs * 1.0) / (2 * widths * np.pi)
+    widths = (fs * 1.0) / (2 * widths)
     cwtmatr, _ = pywt.cwt(signal, widths, "cmor1.0-1.0")
     scal_matrix = np.flip(np.abs(cwtmatr) ** 2, axis=0)
 

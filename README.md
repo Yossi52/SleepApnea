@@ -5,7 +5,8 @@ This repository contains the implementation of multi-channel image fusion method
 ## Features
 
 - **Multiple Datasets**: Physionet Apnea-ECG and UCDDB
-- **Two Evaluation Protocols**: 10-fold cross-validation and subject-wise split
+- **Three Evaluation Protocols**: segment-wise 10-fold cross-validation, subject-wise split
+  (withheld recordings), and record-wise (subject-grouped) 10-fold cross-validation
 - **Various Model Architectures**:
   - Baseline (single transformation method)
   - Early Fusion (3-channel fusion image)
@@ -29,8 +30,8 @@ image_fusion_for_git/
 │   ├── models/               # Model architectures
 │   ├── training/             # Training and evaluation
 │   └── utils/                # Utility functions
-├── experiments/              # Training scripts
-├── analysis/                 # Post-hoc analysis (CKA similarity)
+├── experiments/              # Training scripts (10-fold, subject-wise, record-wise grouped)
+├── analysis/                 # Post-hoc analysis (CKA, attention, AHI, error complementarity)
 └── results/                  # Output directory
 ```
 
@@ -123,6 +124,23 @@ python experiments/train_10fold.py --config config/physionet_10fold_transformer.
 python experiments/train_subject_wise.py --config config/physionet_subject_wise_transformer.yaml
 ```
 
+#### Record-wise (Subject-Grouped) 10-Fold — UCDDB
+Segment-wise 10-fold shares recordings between train and test. This protocol splits on the
+subject group instead, so train, validation and test recordings are disjoint:
+
+```bash
+# Inspect the split first (no training)
+python experiments/train_grouped_ucddb.py --data_dir /path/to/ucddb/images \
+    --model_type single --image_trans scalogram --dry_run
+
+python experiments/train_grouped_ucddb.py --data_dir /path/to/ucddb/images \
+    --model_type hybrid --channel_order rp,gadf,scalogram --random_state 128 --gpu 0
+```
+
+Configured by CLI flags rather than YAML, resumable per fold, one job = one model x one seed
+x all folds. See [`experiments/README.md`](experiments/README.md) for the full option list
+and output layout.
+
 ## Configuration
 
 Edit YAML files in `config/` directory to customize experiments:
@@ -152,10 +170,22 @@ See `config/` directory for more examples.
 
 Results are saved in JSON format under `results/` directory:
 - `results/histories/`: Training history for each fold
-- `results/test_results/`: Test metrics for each fold
-- `results/attention_analysis/`: Attention analysis (Transformer models only)
+- `results/test_results/`: Test metrics and per-segment predictions for each fold
+- `results/attention_analysis/`: Attention weights and summary (Transformer models only)
+- `results/ucddb_grouped/`: Record-wise 10-fold results (see `experiments/README.md`)
 
 ## Post-hoc Analysis
+
+All post-hoc analyses live in `analysis/` and consume artifacts the training scripts already
+wrote (checkpoints, test-result JSONs, per-segment CSVs) — none of them retrains anything.
+See [`analysis/README.md`](analysis/README.md) for options and outputs.
+
+| Script | Question | Input |
+|---|---|---|
+| `cka_analysis.py` | Do different transformations learn similar representations? | trained single-method models |
+| `extract_attention.py` + `analyze_attention.py` | Which branch does the transformer attend to? | transformer fusion checkpoints |
+| `ahi_from_segment_csv.py` | How accurate is the recording-level AHI? | `*_test_segment_predictions.csv` |
+| `error_complementarity.py` | Do the transformations fail on different segments? | `*_test_results.json` |
 
 ### CKA (Centered Kernel Alignment) Similarity
 
@@ -186,4 +216,22 @@ Three independent EfficientNet-B0 branches, features concatenated before classif
 
 ### Transformer Fusion
 Three EfficientNet-B0 branches with Transformer encoder for attention-based fusion
+
+## Citation
+
+If you use this code for your research, please cite our paper:
+
+```bibtex
+@article{your_paper,
+  title={Your Paper Title},
+  author={Your Name},
+  journal={Journal Name},
+  year={2024}
+}
+```
+
+## License
+
+MIT License
+
 

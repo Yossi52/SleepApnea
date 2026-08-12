@@ -2,10 +2,43 @@
 Evaluator class for model testing
 """
 
+import csv
+import os
+import re
+from pathlib import Path
+
 import torch
 from tqdm import tqdm
 import numpy as np
 from ..utils.metrics import calculate_metrics
+
+# <record>_segment<NNN>_label<0|1>.npy
+SEGMENT_NAME_RE = re.compile(r'^(?P<record>.+?)_segment(?P<segment>\d+)_label(?P<label>\d+)')
+
+
+def save_segment_predictions(csv_path, file_list, true_labels, pred_labels, pred_probs):
+    """Write one row per test segment.
+
+    This is the input of `analysis/ahi_from_segment_csv.py`: recording-level AHI needs to
+    know which recording and which minute each prediction belongs to, which only the
+    filename carries.
+    """
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, 'w', newline='') as fh:
+        w = csv.writer(fh)
+        w.writerow(['dataset_index', 'file_path', 'record_id', 'segment_index',
+                    'label_from_filename', 'y_true', 'y_pred', 'prob_class0', 'prob_class1'])
+        for i, path in enumerate(file_list):
+            m = SEGMENT_NAME_RE.match(os.path.basename(path))
+            record = m['record'] if m else ''
+            segment = int(m['segment']) if m else ''
+            label = int(m['label']) if m else ''
+            w.writerow([i, path, record, segment, label,
+                        int(true_labels[i]), int(pred_labels[i]),
+                        float(pred_probs[i][0]), float(pred_probs[i][1])])
+    print(f"Segment predictions saved: {csv_path} ({len(file_list)} rows)")
+    return csv_path
 
 
 class Evaluator:
@@ -15,14 +48,16 @@ class Evaluator:
         self.model = model
         self.device = device
     
-    def evaluate(self, test_loader, model_path=None):
+    def evaluate(self, test_loader, model_path=None, segment_csv_path=None):
         """
         Evaluate model on test set
-        
+
         Args:
-            test_loader: DataLoader for test set
+            test_loader: DataLoader for test set (must not be shuffled)
             model_path: Path to saved model weights (if None, use current model)
-            
+            segment_csv_path: If given, also write a per-segment prediction CSV there
+                (input for analysis/ahi_from_segment_csv.py)
+
         Returns:
             Dictionary of test metrics
         """
@@ -60,7 +95,11 @@ class Evaluator:
         
         # Calculate metrics
         metrics = calculate_metrics(true_labels, pred_labels, pred_probs)
-        
+
+        if segment_csv_path:
+            save_segment_predictions(segment_csv_path, test_loader.dataset.file_list,
+                                     true_labels, pred_labels, pred_probs)
+
         # Print results
         print("\n" + "="*80)
         print("Test Results:")

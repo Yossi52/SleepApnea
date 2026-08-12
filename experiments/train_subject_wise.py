@@ -198,7 +198,12 @@ def main():
         
         # Test
         evaluator = Evaluator(model, device)
-        test_results = evaluator.evaluate(test_loader, str(model_save_path))
+        # Per-segment CSV: recording-level AHI analysis (analysis/ahi_from_segment_csv.py)
+        # needs the record/segment of every prediction, which only the filenames carry.
+        segment_csv = (Path(config.logging.save_dir) / 'test_results' /
+                       f"{exp_name}_test_segment_predictions.csv")
+        test_results = evaluator.evaluate(test_loader, str(model_save_path),
+                                          segment_csv_path=segment_csv)
         
         # Save results
         logger = ResultLogger(config.logging.save_dir, exp_name)

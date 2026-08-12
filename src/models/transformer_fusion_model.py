@@ -39,10 +39,10 @@ class TransformerFusionModel(nn.Module):
         # Classifier
         self.classifier = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
+            nn.Dropout(0.2),
             nn.Linear(d_model, 512),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.2),
             nn.Linear(512, num_classes)
         )
         
