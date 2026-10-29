@@ -1,131 +1,67 @@
 # Experiments
 
-## Scripts
+## `train.py`: withheld and segment-wise 10-fold
 
-### `train_10fold.py`
-10-fold cross-validation training for all model types.
-
-**Usage:**
 ```bash
-python experiments/train_10fold.py --config config/physionet_10fold_transformer.yaml --gpu 0
+python experiments/train.py --data_dir DATA --protocol {withheld,10fold} --model_type TYPE \
+    [--image_trans T | --channel_order a,b,c] [--seeds ...] [--folds ...]
 ```
 
-**What it does:**
-1. Loads configuration from YAML file
-2. Splits data into 10 folds (stratified)
-3. For each fold:
-   - Trains model on 8 folds
-   - Validates on 1 fold
-   - Tests on 1 fold
-4. Computes average performance across folds
-5. Saves results to JSON files
+`DATA` holds the folders written by `image_transformation/` (`<transform>_drop/`, `fusion_drop/`).
 
-### `train_subject_wise.py`
-Subject-wise split training (files with 'x' are test set).
-
-**Usage:**
-```bash
-python experiments/train_subject_wise.py --config config/physionet_subject_wise_transformer.yaml --gpu 0
-```
-
-**What it does:**
-1. Splits data by subject IDs ('x' files = test set)
-2. Randomly splits remaining files into train/validation
-3. Trains and evaluates model
-4. Saves results to JSON files, plus a per-segment prediction CSV
-   (`<exp_name>_test_segment_predictions.csv`) used by `analysis/ahi_from_segment_csv.py`
-
-### `train_grouped_ucddb.py`
-Record-wise (subject-grouped) 10-fold cross-validation on UCDDB.
-
-**Why it exists:** segment-wise 10-fold puts segments of the same recording in both train and
-test, so its accuracy is optimistic. This script splits on the subject group instead:
-`StratifiedGroupKFold` for train+val / test, plus a subject-disjoint validation hold-out
-inside train+val. Train, validation and test recordings never overlap - asserted every fold.
-Everything else (architectures, optimizer, scheduler, augmentation, training numerics) is the
-same as the segment-wise runs, so the two protocols are directly comparable.
-
-**Usage:**
-```bash
-# Print the fold/subject split and class balance, then exit (no training)
-python experiments/train_grouped_ucddb.py --data_dir /path/to/ucddb/images \
-    --model_type single --image_trans scalogram --dry_run
-
-# One model, one seed, all 10 folds
-python experiments/train_grouped_ucddb.py --data_dir /path/to/ucddb/images \
-    --model_type single --image_trans scalogram --random_state 128 --gpu 0
-
-# Fusion models: --channel_order picks the three branches
-python experiments/train_grouped_ucddb.py --data_dir /path/to/ucddb/images \
-    --model_type hybrid --channel_order rp,gadf,scalogram --random_state 128 --gpu 0
-```
-
-**`--data_dir` layout** (produced by `image_transformation/ucddb/`):
-```
-<data_dir>/
-├── gadf_drop/ gasf_drop/ mtf_drop/ rp_drop/ scalogram_drop/ spectrogram_drop/
-├── fusion_drop/          # 6-channel fusion image
-└── gadf/ ... fusion/     # same without quality control, used by --no-seg_drop
-```
-Filenames must be `<subject>_segment<NNN>_label<0|1>.npy` - the subject prefix is the CV group.
-
-**Model types:** `single` (one transformation), `early` (3 channels of the fusion image),
-`late` / `hybrid` (three single-channel branches, concatenated / transformer-fused),
-`mb_late` / `mb_hybrid` (three branches fed whole RGB images, one per transformation).
-
-**Key options:**
-
-| Option | Default | Meaning |
+| Protocol | Test set | Validation |
 |---|---|---|
-| `--random_state` | 128 | seeds the fold split and the validation hold-out |
-| `--n_splits` | 10 | number of folds |
-| `--pretrained` / `--no-pretrained` | on | ImageNet weights (ablation "+Pre") |
-| `--seg_drop` / `--no-seg_drop` | on | use the quality-controlled `*_drop` dirs (ablation "+SQC") |
-| `--resume` / `--no-resume` | on | skip finished folds, restore `last.pt` of an interrupted one |
-| `--dry_run` | off | print the split and exit |
-| `--max_folds` | all | run only the first N folds (smoke tests) |
-| `--output_dir` | `results/ucddb_grouped` | results, logs, stats, state |
+| `withheld` | Apnea-ECG x01-x35 | stratified 20% of the remaining segments, seeded |
+| `10fold` | fold k of `StratifiedKFold(10, shuffle, seed)` | stratified 1/9 of the other folds, seed + k - 1 |
+
+| `--model_type` | Input | lr / OneCycle max_lr | grad clip | batch |
+|---|---|---|---|---|
+| `single` | one transform, viridis RGB | 5e-4 / 1e-3 | 1.0 | 16 |
+| `early` | three fusion channels as one RGB image | 5e-4 / 1e-3 | 1.0 | 32 |
+| `late` | one fusion channel per EfficientNet-B0 branch, features concatenated | 5e-6 / 1e-4 | 0.5 | 32 |
+| `hybrid` | as `late`, fused by a 3-layer Pre-LN transformer (d=1280, 8 heads, dropout 0.2) | 5e-6 / 1e-4 | 0.5 | 32 |
+| `mb_late`, `mb_hybrid` | as `late`/`hybrid`, each branch fed the viridis RGB image (encoding control) | 5e-6 / 1e-4 | 0.5 | 32 |
+
+Common settings: ImageNet-pretrained EfficientNet-B0 (`--no-pretrained` to ablate), AdamW
+(weight decay 1e-5), OneCycleLR (5% warm-up), weighted cross-entropy with label smoothing 0.1,
+fp16 mixed precision, up to 100 epochs, early stopping after 10 epochs without a lower
+validation loss. Normalized batches are divided by 255 whenever their maximum exceeds 1, as in
+the paper's training code; checkpoints trained this way need the same step at inference.
+`--channel_order` sets R, G, B (= branches 0, 1, 2); the default is the order
+chosen by `analysis/select_fusion_inputs.py` in the paper.
+
+Outputs under `--out_dir` (default `results/`): `runs/<job>.json` (config, per-epoch history,
+test metrics and predictions), `predictions/<job>_test_segment_predictions.csv`, `stats/<job>.npz`,
+`checkpoints/<job>.pt`. Runs that already have a JSON are skipped.
+
+Segments are taken in sorted filename order. The paper's runs used `os.listdir` order, so the
+same seed gives the same withheld test set but different 10-fold memberships.
+
+## `train_grouped_ucddb.py`: record-wise 10-fold on UCDDB
+
+Segment-wise folds put segments of one recording in both train and test. This script splits
+on the subject instead: `StratifiedGroupKFold` for test, plus a subject-disjoint validation
+hold-out (about 1/9 of the training subjects, at least 2). Overlap is asserted every fold.
+
+```bash
+# print the split and exit
+python experiments/train_grouped_ucddb.py --data_dir DATA --model_type single --image_trans scalogram --dry_run
+# one model, one seed, all folds
+python experiments/train_grouped_ucddb.py --data_dir DATA --model_type hybrid \
+    --channel_order scalogram,gadf,spectrogram --random_state 128 --gpu 0
+```
+
+Same models and optimizer as `train.py`, except that every model type uses batch 32 and
+OneCycle `final_div_factor` 1e4, as in the paper's grouped runs.
+
+| Option | Default | |
+|---|---|---|
+| `--random_state` | 128 | seeds the folds and the validation hold-out |
+| `--pretrained` / `--seg_drop` | on | turn off for the ablation |
+| `--resume` | on | skip finished folds, continue an interrupted one from `last.pt` |
+| `--output_dir` | `results/ucddb_grouped` | results, history, stats, state, logs |
 | `--ckpt_dir` | `results/ucddb_grouped/checkpoints` | per-fold `best.pt` / `last.pt` |
 
-**Output tree:**
-```
-results/ucddb_grouped/
-├── results/ucddb_grouped_10fold.csv      # one row per fold: accuracy, sens, spec, F1, AUC, runtime
-├── results/fold_subject_mapping.csv      # which subject was in train/valid/test per fold
-├── results/segment_predictions/<job>.csv # per-segment y_true / y_prob / y_pred
-├── history/<job>_fold<k>.json            # per-epoch loss/acc/AUC
-├── stats/<job>_fold<k>.npz               # normalization statistics (train split only)
-├── state/run_state_<job>.json            # fold completion state, used by --resume
-├── logs/<job>.log
-└── env/                                  # torch/CUDA/platform snapshot + resolved config
-```
-
-Each invocation is one job (`<transform-or-channels>_<model_type>_rs<seed>`), and jobs write
-to separate state and stats files, so several can run concurrently on different GPUs. SIGINT
-and SIGTERM checkpoint the current epoch and exit; rerunning with `--resume` continues.
-
-
-## Configuration
-
-All experiments are configured through YAML files in `config/` directory.
-
-Key configuration parameters:
-- `dataset.data_dir`: Path to image data
-- `model.type`: Model architecture (baseline/late/transformer)
-- `training.batch_size`, `training.epochs`, etc.
-
-See example configs in `config/` directory.
-
-## Output
-
-Results are saved to `results/` directory:
-- `results/models/`: Trained model weights (.pth files)
-- `results/test_results/`: Test metrics and predictions (JSON files)
-- `stats/`: Normalization statistics (.npz files)
-
-## Notes
-
-- GPU is automatically used if available
-- Mixed precision training is enabled for faster training
-- Early stopping is used to prevent overfitting
-- All random seeds are fixed for reproducibility
+Results: `results/ucddb_grouped_10fold.csv` (one row per fold), `results/fold_subject_mapping.csv`,
+`results/segment_predictions/<job>.csv`. Jobs keep separate state and stats files, so several
+can run at once; SIGINT/SIGTERM save the current epoch.

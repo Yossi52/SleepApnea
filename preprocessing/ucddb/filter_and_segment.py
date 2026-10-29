@@ -39,13 +39,10 @@ def median_filter(data, kernel_size=5):
 
 def apply_all_filters(data, fs=128):
     """Apply all preprocessing filters"""
-    # 45Hz low-pass filter
     data = lowpass_filter(data, cutoff=45, fs=fs)
     
-    # 0.5-10Hz bandpass filter
     data = bandpass_filter(data, lowcut=0.5, highcut=10, fs=fs)
     
-    # Median filter
     data = median_filter(data, kernel_size=5)
     
     return data
@@ -88,17 +85,14 @@ def segment_signal(signal_data, labels, segment_length=60, fs=128, drop_bad_segm
         start_sample = int(row['start_time'] * fs)
         end_sample = int(row['end_time'] * fs)
         
-        # Check if we have enough samples
         if end_sample > len(signal_data):
             break
         
         segment = signal_data[start_sample:end_sample]
         
-        # Check segment length
         if len(segment) != segment_samples:
             continue
         
-        # Check segment quality
         if drop_bad_segments and not check_segment_quality(segment):
             continue
         
@@ -109,7 +103,6 @@ def segment_signal(signal_data, labels, segment_length=60, fs=128, drop_bad_segm
 
 def process_subject(subject_id, data_dir, label_dir, output_dir, drop_bad_segments=True):
     """Process a single subject"""
-    # Load signal
     record_name = f"ucddb{subject_id}"
     record = wfdb.rdrecord(os.path.join(data_dir, record_name))
     
@@ -117,24 +110,20 @@ def process_subject(subject_id, data_dir, label_dir, output_dir, drop_bad_segmen
     ecg_signal = record.p_signal[:, 0]
     fs = record.fs
     
-    # Apply filters
     filtered_signal = apply_all_filters(ecg_signal, fs=fs)
     
-    # Load labels
     label_file = os.path.join(label_dir, f"ucddb{subject_id}_label_5sec.csv")
     labels = pd.read_csv(label_file)
     
-    # Segment signal
     segments = segment_signal(filtered_signal, labels, segment_length=60, fs=fs, 
                             drop_bad_segments=drop_bad_segments)
     
-    # Save segments
     subject_output_dir = os.path.join(output_dir, f"ucddb{subject_id}")
     os.makedirs(subject_output_dir, exist_ok=True)
     
     segment_info = []
     for i, (segment, label) in enumerate(segments):
-        segment_filename = f"ucddb{subject_id}_seg{i:04d}_label{label}.npy"
+        segment_filename = f"{subject_id}_segment{i:03d}_label{label}.npy"
         segment_path = os.path.join(subject_output_dir, segment_filename)
         np.save(segment_path, segment)
         
@@ -145,7 +134,6 @@ def process_subject(subject_id, data_dir, label_dir, output_dir, drop_bad_segmen
             'filename': segment_filename
         })
     
-    # Save segment info
     info_df = pd.DataFrame(segment_info)
     info_df.to_csv(os.path.join(subject_output_dir, 'segment_info.csv'), index=False)
     
@@ -171,7 +159,6 @@ def main():
     print(f"Drop bad segments: {drop_bad_segments}")
     print("=" * 80)
     
-    # Get list of subjects
     label_files = sorted([f for f in os.listdir(args.label_dir) if f.endswith('_label_5sec.csv')])
     subject_ids = [f.split('ucddb')[1].split('_')[0] for f in label_files]
     

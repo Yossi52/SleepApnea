@@ -9,13 +9,10 @@ reported accuracy is optimistic. This script instead splits on the *subject* gro
   2. Results, checkpoints and logs are written incrementally to a resumable output tree,
      so an interrupted job (`--resume`, on by default) continues where it stopped.
 
-One invocation = 1 model x 1 seed x all folds, run sequentially. The model architectures,
-optimizer, scheduler, augmentation and training-loop numerics are the same as the
-segment-wise UCDDB experiments, so the two protocols are directly comparable; only the
-split differs.
+One invocation = 1 model x 1 seed x all folds. Models, augmentation and optimizer settings
+match the segment-wise runs; only the split differs.
 
-Inputs are the per-segment .npy images produced by
-`image_transformation/ucddb/{image_trans_single_method,make_fusion_image}.py`, laid out as
+Inputs are the per-segment .npy images produced by `image_transformation/`, laid out as
 
     <data_dir>/
         gadf_drop/ gasf_drop/ mtf_drop/ rp_drop/ scalogram_drop/ spectrogram_drop/
@@ -29,12 +26,11 @@ Usage:
         --model_type single --image_trans scalogram --random_state 128 --gpu 0
 
     python experiments/train_grouped_ucddb.py --data_dir /path/to/ucddb/images \
-        --model_type hybrid --channel_order rp,gadf,scalogram --dry_run
+        --model_type hybrid --channel_order scalogram,gadf,spectrogram --dry_run
 """
 import argparse
 import csv
 import json
-import math
 import os
 import platform
 import random
@@ -47,14 +43,16 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from torchvision import models, transforms
 from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score, roc_auc_score)
 from sklearn.model_selection import StratifiedGroupKFold
 from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.data import TRANSFORMS, train_transform, valid_transform  # noqa: E402
+from src.models import build_model  # noqa: E402
 
 # UCDDB: 002_segment000_label0.npy   Apnea-ECG: a01_segment000_label0.npy
 FNAME_RE = re.compile(r'^(?P<subject>.+?)_segment(?P<segment>\d+)_label(?P<label>\d+)\.npy$')
@@ -68,398 +66,9 @@ def parse_name(fname):
     return m['subject'], int(m['segment']), int(m['label'])
 
 
-# ============================================================================
-# 1. Models -- identical to the segment-wise UCDDB experiments
-# ============================================================================
+# Data: row-indexed image directories
 
-def modify_pretrained_model(model_name, num_classes, freeze_layers='partial', pretrained=True):
-    """ImageNet-pretrained backbone with a fresh 2-class head."""
-    if model_name.startswith('efficientnet'):
-        if '_v2' in model_name:
-            version = model_name.split('efficientnet_v2_')[1]
-            model_fn = getattr(models, f'efficientnet_v2_{version}')
-            weights = 'IMAGENET1K_V1' if pretrained else None
-            model = model_fn(weights=weights)
-        else:
-            version = model_name.split('efficientnet_')[1]
-            model_fn = getattr(models, f'efficientnet_{version}')
-            weights = 'IMAGENET1K_V1' if pretrained else None
-            model = model_fn(weights=weights)
-
-        if freeze_layers == 'partial':
-            total_blocks = len(model.features)
-            freeze_until = total_blocks * 2 // 3
-            for name, param in model.named_parameters():
-                block_num = int(name.split('.')[1]) if 'features' in name else total_blocks
-                if block_num < freeze_until and 'classifier' not in name:
-                    param.requires_grad = False
-
-        final_layer = 'classifier'
-        in_features = model.classifier[1].in_features
-
-    elif model_name.startswith('mobilenet_v3'):
-        version = model_name.split('mobilenet_v3_')[1]
-        model_fn = getattr(models, f'mobilenet_v3_{version}')
-        weights = 'IMAGENET1K_V1' if pretrained else None
-        model = model_fn(weights=weights)
-
-        if freeze_layers == 'partial':
-            total_blocks = len(model.features)
-            freeze_until = total_blocks * 2 // 3
-            for name, param in model.named_parameters():
-                block_num = int(name.split('.')[1]) if 'features' in name else total_blocks
-                if block_num < freeze_until and 'classifier' not in name:
-                    param.requires_grad = False
-
-        final_layer = 'classifier'
-        in_features = model.classifier[-1].in_features
-    else:
-        raise ValueError(f'Unsupported model: {model_name}')
-
-    if freeze_layers == 'all':
-        for param in model.parameters():
-            param.requires_grad = False
-    elif freeze_layers == 'none':
-        for param in model.parameters():
-            param.requires_grad = True
-
-    if final_layer == 'classifier':
-        if model_name.startswith('mobilenet_v3'):
-            if 'large' in model_name:
-                model.classifier = nn.Sequential(
-                    nn.Linear(960, 1280), nn.Hardswish(), nn.Dropout(p=0.2),
-                    nn.Linear(1280, num_classes))
-            elif 'small' in model_name:
-                model.classifier = nn.Sequential(
-                    nn.Linear(576, 1024), nn.Hardswish(), nn.Dropout(p=0.2),
-                    nn.Linear(1024, num_classes))
-        else:  # efficientnet
-            model.classifier = nn.Sequential(
-                nn.Dropout(p=0.2), nn.Linear(in_features, num_classes))
-
-    return model
-
-
-class LateFusionModel(nn.Module):
-    """Three single-channel EfficientNet-B0 branches, features concatenated."""
-
-    def __init__(self, num_classes=2, pretrained=True):
-        super().__init__()
-        self.num_classes = num_classes
-        self.pretrained = pretrained
-        self.feature_extractors = nn.ModuleList([
-            self._create_modified_efficientnet() for _ in range(3)])
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.2), nn.Linear(1280 * 3, 512), nn.ReLU(),
-            nn.Dropout(0.2), nn.Linear(512, num_classes))
-        self._initialize_classifier()
-
-    def _create_modified_efficientnet(self):
-        weights = 'IMAGENET1K_V1' if self.pretrained else None
-        model = models.efficientnet_b0(weights=weights)
-        features = model.features
-        original_conv = features[0][0]
-        averaged_weight = original_conv.weight.data.mean(dim=1, keepdim=True)
-        new_conv = nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1, bias=False)
-        new_conv.weight.data = averaged_weight
-        features[0][0] = new_conv
-        return features
-
-    def _initialize_classifier(self):
-        for m in self.classifier.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, input_images):
-        r_input = input_images[:, 0:1, :, :]
-        g_input = input_images[:, 1:2, :, :]
-        b_input = input_images[:, 2:3, :, :]
-        inputs = [r_input, g_input, b_input]
-        features = []
-        for i, input_tensor in enumerate(inputs):
-            feat = self.feature_extractors[i](input_tensor)
-            feat = F.adaptive_avg_pool2d(feat, 1).flatten(1)
-            features.append(feat)
-        combined = torch.cat(features, dim=1)
-        return self.classifier(combined)
-
-
-class MultiHeadAttentionWithWeights(nn.Module):
-    """Multi-head self-attention that also returns the attention weights."""
-
-    def __init__(self, d_model, nhead, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-        assert self.head_dim * nhead == d_model, 'd_model must be divisible by nhead'
-        self.q_linear = nn.Linear(d_model, d_model)
-        self.k_linear = nn.Linear(d_model, d_model)
-        self.v_linear = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self._init_weights()
-
-    def _init_weights(self):
-        for layer in [self.q_linear, self.k_linear, self.v_linear, self.out_proj]:
-            nn.init.xavier_uniform_(layer.weight)
-            if layer.bias is not None:
-                nn.init.zeros_(layer.bias)
-
-    def forward(self, query, key, value, attn_mask=None, key_padding_mask=None):
-        batch_size, seq_len, d_model = query.size()
-        Q = self.q_linear(query).view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
-        K = self.k_linear(key).view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
-        V = self.v_linear(value).view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if attn_mask is not None:
-            scores = scores.masked_fill(attn_mask == 0, -1e9)
-        if key_padding_mask is not None:
-            scores = scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), -1e9)
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        attn_output = torch.matmul(attn_weights, V)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
-        output = self.out_proj(attn_output)
-        return output, attn_weights
-
-
-class CustomTransformerEncoderLayer(nn.Module):
-    """Pre-LN transformer encoder layer exposing its attention weights."""
-
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation='relu'):
-        super().__init__()
-        self.self_attn = MultiHeadAttentionWithWeights(d_model, nhead, dropout)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.activation = F.relu if activation == 'relu' else F.gelu
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.linear1.weight)
-        nn.init.zeros_(self.linear1.bias)
-        nn.init.xavier_uniform_(self.linear2.weight)
-        nn.init.zeros_(self.linear2.bias)
-        nn.init.ones_(self.norm1.weight)
-        nn.init.zeros_(self.norm1.bias)
-        nn.init.ones_(self.norm2.weight)
-        nn.init.zeros_(self.norm2.bias)
-
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        src_norm = self.norm1(src)
-        src2, attn_weights = self.self_attn(src_norm, src_norm, src_norm,
-                                             attn_mask=src_mask,
-                                             key_padding_mask=src_key_padding_mask)
-        src = src + self.dropout1(src2)
-        src_norm = self.norm2(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src_norm))))
-        src = src + self.dropout2(src2)
-        return src, attn_weights
-
-
-class CustomTransformerEncoder(nn.Module):
-    """Stack of CustomTransformerEncoderLayer, optionally returning attention."""
-
-    def __init__(self, encoder_layer, num_layers):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            type(encoder_layer)(
-                encoder_layer.self_attn.d_model, encoder_layer.self_attn.nhead,
-                encoder_layer.linear1.out_features, encoder_layer.dropout1.p)
-            for _ in range(num_layers)])
-        self.num_layers = num_layers
-
-    def forward(self, src, mask=None, src_key_padding_mask=None, return_attention_weights=False):
-        output = src
-        attention_weights = []
-        for layer in self.layers:
-            output, attn_weights = layer(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
-            if return_attention_weights:
-                attention_weights.append(attn_weights)
-        if return_attention_weights:
-            return output, attention_weights
-        return output
-
-
-class TransformerFusionModel(nn.Module):
-    """Transformer fusion of the three branches (--model_type hybrid)."""
-
-    def __init__(self, num_classes=2, d_model=1280, nhead=8, num_layers=3, dropout=0.1, pretrained=True):
-        super().__init__()
-        self.d_model = d_model
-        self.num_layers = num_layers
-        self.nhead = nhead
-        self.pretrained = pretrained
-        self.feature_extractors = nn.ModuleList([
-            self._create_modified_efficientnet() for _ in range(3)])
-        self.channel_embeddings = nn.Parameter(torch.randn(3, d_model))
-        encoder_layer = CustomTransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
-            dropout=dropout, activation='relu')
-        self.transformer = CustomTransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.final_norm = nn.LayerNorm(d_model)
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(d_model), nn.Dropout(dropout), nn.Linear(d_model, 512),
-            nn.ReLU(), nn.Dropout(dropout), nn.Linear(512, num_classes))
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.normal_(self.channel_embeddings, mean=0, std=0.02)
-        for m in self.classifier.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def _create_modified_efficientnet(self):
-        weights = 'IMAGENET1K_V1' if self.pretrained else None
-        model = models.efficientnet_b0(weights=weights)
-        features = model.features
-        original_conv = features[0][0]
-        averaged_weight = original_conv.weight.data.mean(dim=1, keepdim=True)
-        new_conv = nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1, bias=False)
-        new_conv.weight.data = averaged_weight
-        features[0][0] = new_conv
-        return features
-
-    def forward(self, input_images, return_attention_weights=False):
-        r_input = input_images[:, 0:1, :, :]
-        g_input = input_images[:, 1:2, :, :]
-        b_input = input_images[:, 2:3, :, :]
-        inputs = [r_input, g_input, b_input]
-        features = []
-        for i, input_tensor in enumerate(inputs):
-            feat = self.feature_extractors[i](input_tensor)
-            feat = F.adaptive_avg_pool2d(feat, 1).flatten(1)
-            features.append(feat)
-        channel_features = torch.stack(features, dim=1)
-        channel_features = channel_features + self.channel_embeddings.unsqueeze(0)
-        if return_attention_weights:
-            encoded_features, attention_weights = self.transformer(
-                channel_features, return_attention_weights=True)
-        else:
-            encoded_features = self.transformer(channel_features)
-        encoded_features = self.final_norm(encoded_features)
-        fused_features = encoded_features.mean(dim=1)
-        logits = self.classifier(fused_features)
-        if return_attention_weights:
-            return logits, attention_weights
-        return logits
-
-
-def _rgb_branch_features(self, input_images):
-    """Per-branch EfficientNet features for the multi-branch models.
-
-    Input is (B, 3 branches, 3 RGB, H, W): branch i gets a whole RGB image of one
-    transform, not one channel of the 6-channel fusion image. Returns [ (B,1280) x3 ].
-    """
-    return [F.adaptive_avg_pool2d(self.feature_extractors[i](input_images[:, i]), 1).flatten(1)
-            for i in range(3)]
-
-
-def _rgb_efficientnet(self):
-    """EfficientNet features with its original 3-channel stem (no averaged 1-ch conv)."""
-    weights = 'IMAGENET1K_V1' if self.pretrained else None
-    return models.efficientnet_b0(weights=weights).features
-
-
-class MultiBranchLateFusionModel(LateFusionModel):
-    """Late fusion over three whole RGB images, one per transform.
-
-    Same as LateFusionModel except each branch keeps the 3-channel stem and is fed a
-    whole RGB image, so it only overrides those two points.
-    """
-    _create_modified_efficientnet = _rgb_efficientnet
-
-    def forward(self, input_images):
-        return self.classifier(torch.cat(_rgb_branch_features(self, input_images), dim=1))
-
-
-class MultiBranchTransformerFusionModel(TransformerFusionModel):
-    """Transformer fusion over three whole RGB images, one per transform.
-
-    TransformerFusionModel with the same two changes as MultiBranchLateFusionModel.
-    Attention-analysis/visualisation helpers of the original are not carried over -- this
-    script only trains and tests.
-    """
-    _create_modified_efficientnet = _rgb_efficientnet
-
-    def forward(self, input_images, return_attention_weights=False):
-        channel_features = (torch.stack(_rgb_branch_features(self, input_images), dim=1)
-                            + self.channel_embeddings.unsqueeze(0))
-        if return_attention_weights:
-            encoded, attn = self.transformer(channel_features, return_attention_weights=True)
-            return self.classifier(self.final_norm(encoded).mean(dim=1)), attn
-        encoded = self.transformer(channel_features)
-        return self.classifier(self.final_norm(encoded).mean(dim=1))
-
-
-# ============================================================================
-# 2. Augmentation -- identical to the segment-wise UCDDB experiments
-# ============================================================================
-
-IMAGE_SIZE = (224, 224)
-
-
-class AdjustBrightness:
-    def __init__(self, brightness_range=0.1):
-        self.brightness_range = brightness_range
-
-    def __call__(self, tensor):
-        factor = torch.empty(1).uniform_(-self.brightness_range, self.brightness_range).item()
-        return tensor + factor
-
-
-class AdjustContrast:
-    def __init__(self, contrast_range=0.1):
-        self.contrast_range = contrast_range
-
-    def __call__(self, tensor):
-        factor = torch.empty(1).uniform_(1 - self.contrast_range, 1 + self.contrast_range).item()
-        return tensor * factor
-
-
-class AddGaussianNoise:
-    def __init__(self, mean=0., std=0.001):
-        self.std = std
-        self.mean = mean
-
-    def __call__(self, tensor):
-        return tensor + torch.randn(tensor.size()) * self.std + self.mean
-
-
-train_transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE, antialias=True),
-    transforms.RandomAffine(degrees=2, translate=(0.02, 0.02), scale=(0.98, 1.02),
-                             interpolation=transforms.InterpolationMode.BILINEAR),
-    AdjustBrightness(brightness_range=0.05),
-    AdjustContrast(contrast_range=0.05),
-    AddGaussianNoise(mean=0., std=0.001),
-])
-
-valid_transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE, antialias=True),
-])
-
-
-# ============================================================================
-# 3. Data: row-indexed image directories
-# ============================================================================
-
-# Channel index of each transform inside the prebuilt 6-channel fusion .npy.
-# Same mapping the segment-wise dataset class uses.
-FUSION_CHANNEL_MAPPING = {
-    'gadf': 0, 'gasf': 1, 'mtf': 2, 'rp': 3, 'scalogram': 4, 'spectrogram': 5,
-}
+FUSION_CHANNEL_MAPPING = {t: i for i, t in enumerate(TRANSFORMS)}
 
 
 def is_multibranch(model_type):
@@ -510,8 +119,7 @@ class GroupedDataset(Dataset):
         i = self.row_indices[idx]
         img = self._build_image(i).astype(np.float32)
         if is_multibranch(self.model_type):
-            # (3,H,W,3) -> per-branch z-score -> (3,3,H,W). The augmentation is drawn
-            # independently per branch.
+            # (3,H,W,3) -> per-branch z-score -> (3,3,H,W); augmentation drawn per branch.
             img = (img - self.mean[:, None, None, :]) / self.std[:, None, None, :]
             image = torch.from_numpy(img.transpose(0, 3, 1, 2)).float()
             if self.transform:
@@ -594,25 +202,15 @@ def _rows_from_names(names):
 
 def load_arrays(data_dir, model_type, image_trans, channel_order, seg_drop=True):
     """Returns (arrays dict, reference rows list) for the requested model type."""
-    # early/late/hybrid read the prebuilt 6-channel fusion image and select one channel per
-    # transform, exactly as the segment-wise dataset class does via fusion_channel_mapping.
-    #
-    # Do NOT substitute "channel 0 of each transform's own RGB .npy" -- the two are not the
-    # same image. The fusion .npy stores a separately generated grayscale rendition per
-    # transform, while the single-transform .npy is viridis-mapped RGB; comparing them
-    # channel-wise gives mean |Delta| of 6-60 (per 0-255 pixel).
-    # seg_drop == SQC (statistical quality control): the *_drop dirs hold the segments that
-    # survived it. seg_drop=False reads the unfiltered dirs.
+    # early/late/hybrid select channels of the grayscale fusion image; channel 0 of the viridis
+    # RGB .npy is a different image. *_drop dirs hold the segments kept by quality control.
     suffix = '_drop' if seg_drop else ''
 
     def read(name):
         arr = ImageDirArray(Path(data_dir) / name)
         return arr, _rows_from_names(arr.names)
 
-    # mb_late/mb_hybrid feed each branch the transform's own RGB image, so it reads one array per
-    # transform. All *_drop dirs hold the same filenames in the same sorted order (verified),
-    # so a row index means the same segment in every branch -- and rows from the first branch
-    # are the reference for the CV split, exactly as the single/fusion paths use theirs.
+    # mb_*: one RGB array per transform; the row order must match across them (asserted).
     if is_multibranch(model_type):
         arrays, rows = {}, None
         for t in channel_order:
@@ -636,9 +234,7 @@ def load_arrays(data_dir, model_type, image_trans, channel_order, seg_drop=True)
     return {key: arr}, rows
 
 
-# ============================================================================
-# 4. Subject-wise split
-# ============================================================================
+# Subject-wise split
 
 def subject_valid_holdout(trainval_idx, subjects, labels, random_state, fold, n_trials=500):
     """Hold out ~1/9 of trainval subjects (>=2) as validation, subject-disjoint from train.
@@ -685,9 +281,7 @@ def class_dist(indices, labels):
     return {'n': len(lbl), 'n_normal': lbl.count(0), 'n_apnea': lbl.count(1)}
 
 
-# ============================================================================
-# 5. Checkpointing / resume / run state
-# ============================================================================
+# Checkpointing / resume / run state
 
 def load_json(path, default):
     if Path(path).exists():
@@ -729,18 +323,12 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_metric,
 
 
 def load_checkpoint(path, model, optimizer, scheduler, device):
-    # weights_only=False is required: the payload carries RNG state, and
-    # np.random.get_state() pickles numpy._core.multiarray._reconstruct, which
-    # torch>=2.6 blocks under the new weights_only=True default. This file is written
-    # by save_checkpoint() a few lines up -- it is our own artifact, not foreign input.
+    # weights_only=False: the payload (written by save_checkpoint) includes numpy RNG state.
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model'])
     optimizer.load_state_dict(ckpt['optimizer'])
     scheduler.load_state_dict(ckpt['scheduler'])
-    # RNG restore is best-effort. It only improves reproducibility of a resumed fold; it is
-    # not required for correctness, so it must never abort a job that has already spent
-    # tens of minutes training. (It did once: map_location=device puts the RNG ByteTensors
-    # on CUDA, and torch.set_rng_state demands CPU ones -- hence the .cpu() calls.)
+    # Best effort: a failed RNG restore must not abort a resumed fold. set_rng_state needs CPU tensors.
     try:
         random.setstate(ckpt['rng_python'])
         np.random.set_state(ckpt['rng_numpy'])
@@ -749,7 +337,7 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
         if cuda_state is not None and torch.cuda.is_available() \
                 and len(cuda_state) == torch.cuda.device_count():
             torch.cuda.set_rng_state_all([s.cpu() for s in cuda_state])
-    except Exception as e:  # noqa: BLE001 - never fatal, see above
+    except Exception as e:  # noqa: BLE001
         print(f'[warn] RNG state not restored ({type(e).__name__}: {e}); '
               f'continuing with fresh RNG.', flush=True)
     return ckpt['epoch'], ckpt['best_metric'], ckpt['patience_counter'], ckpt['history']
@@ -767,10 +355,7 @@ signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
 
-# ============================================================================
-# 6. Train / test loops -- same numerics as the segment-wise experiments, plus per-epoch
-#    checkpointing/resume.
-# ============================================================================
+# Train / test loops
 
 def check_nan_inf(tensor, name, log):
     if torch.isnan(tensor).any():
@@ -865,8 +450,6 @@ def train_one_fold(model, train_loader, valid_loader, criterion, optimizer, sche
                     outputs = model(X)
                     loss = criterion(outputs, Y)
                 if torch.isnan(loss) or torch.isinf(loss):
-                    # Was silent, unlike the training loop's warning -- which is why the
-                    # fp16 overflow (see test_fold) left no trace in any of the 63 job logs.
                     n_skipped_val += 1
                     continue
                 probabilities = torch.softmax(outputs, dim=1)
@@ -927,11 +510,7 @@ def test_fold(model, test_loader, device, best_path):
     model.eval()
 
     true_labels, pred_labels, pred_probs = [], [], []
-    # fp32, deliberately: under fp16 autocast some segments push EfficientNet activations
-    # past the fp16 range (65504) at features.7.0.block.0.0 -> +/-inf, and SiLU(-inf) =
-    # -inf * 0 = NaN, which torch.clamp does NOT filter. That NaN reached roc_auc_score and
-    # killed mtf_single_rs128 fold 8. Testing is a few percent of runtime, so fp32 is cheap;
-    # measured effect on metrics is <=0.002.
+    # fp32: some segments overflow fp16 inside EfficientNet and give NaN logits.
     with torch.no_grad():
         for X, Y in tqdm(test_loader, desc='Testing'):
             X = X.to(device, dtype=torch.float32)
@@ -970,46 +549,22 @@ def test_fold(model, test_loader, device, best_path):
     return metrics, true_labels, pred_labels, pred_probs
 
 
-# ============================================================================
-# 7. CLI / orchestration
-# ============================================================================
+# CLI / orchestration
 
 def sanitize(s):
     return re.sub(r'[ :,()]+', '', str(s))
 
 
+# model_type -> (lr, max_lr, max_norm). The grouped runs used final_div_factor 1e4 and batch 32
+# for every model type, unlike src/engine.py (segment-wise runs).
 HYPERPARAMS = {
-    # (model_type) -> (lr, max_lr, max_norm)
     'single': (5e-4, 1e-3, 1.0),
     'early': (5e-4, 1e-3, 1.0),
     'late': (5e-6, 1e-4, 0.5),
     'hybrid': (5e-6, 1e-4, 0.5),
-    # multi-branch variants use the same schedule as late/hybrid.
     'mb_late': (5e-6, 1e-4, 0.5),
     'mb_hybrid': (5e-6, 1e-4, 0.5),
 }
-
-
-def build_model(model_type, pretrained):
-    if model_type in ('single', 'early'):
-        model = modify_pretrained_model('efficientnet_b0', 2, 'none', pretrained=pretrained)
-    elif model_type == 'late':
-        model = LateFusionModel(num_classes=2, pretrained=pretrained)
-    elif model_type == 'hybrid':
-        model = TransformerFusionModel(num_classes=2, d_model=1280, nhead=8, num_layers=3,
-                                        dropout=0.2, pretrained=pretrained)
-    elif model_type == 'mb_late':
-        model = MultiBranchLateFusionModel(num_classes=2, pretrained=pretrained)
-    elif model_type == 'mb_hybrid':
-        model = MultiBranchTransformerFusionModel(num_classes=2, d_model=1280, nhead=8,
-                                                   num_layers=3, dropout=0.2,
-                                                   pretrained=pretrained)
-    else:
-        raise ValueError(model_type)
-    for m in model.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.eps = 1e-3
-    return model
 
 
 def build_arg_parser():
@@ -1023,13 +578,11 @@ def build_arg_parser():
     p.add_argument('--model_type',
                    choices=['single', 'early', 'late', 'hybrid', 'mb_late', 'mb_hybrid'],
                    required=True)
-    p.add_argument('--channel_order', default='gadf,rp,scalogram',
+    p.add_argument('--channel_order', default='scalogram,gadf,spectrogram',
                    help='comma-separated, early/late/hybrid/mb_* only')
     p.add_argument('--random_state', type=int, default=128)
     p.add_argument('--n_splits', type=int, default=10)
     p.add_argument('--gpu', type=int, default=0)
-    # Ablation axes. The defaults are the full setting (pretrained + quality control);
-    # turn them off one at a time for the ablation table.
     p.add_argument('--pretrained', action=argparse.BooleanOptionalAction, default=True,
                    help='ImageNet pretrained weights ("+Pre")')
     p.add_argument('--seg_drop', action=argparse.BooleanOptionalAction, default=True,
@@ -1062,8 +615,7 @@ def main():
     ckpt_dir = Path(args.ckpt_dir)
 
     tag = sanitize(args.image_trans) if args.model_type == 'single' else sanitize('-'.join(channel_order))
-    # pretrained/seg_drop must be in the id: the ablation runs the same transform+seed
-    # under 4 configs, and they would otherwise share stats/checkpoint/prediction paths.
+    # Ablation settings go into the id so their stats/checkpoints/predictions do not collide.
     abl = '' if (args.pretrained and args.seg_drop) else \
         f"_pre{int(args.pretrained)}sqc{int(args.seg_drop)}"
     job_id = f'{tag}_{args.model_type}_rs{args.random_state}{abl}'
@@ -1100,7 +652,6 @@ def main():
                 w.writerow(['fold', 'split', 'subject', 'n_segments', 'n_apnea'])
             w.writerows(rows)
 
-    # -- Dry run: print split + class distribution, exit before any training --
     if args.dry_run:
         for fold, (trainval_idx, test_idx) in enumerate(folds):
             train_idx, valid_idx, train_subj, valid_subj = subject_valid_holdout(
@@ -1119,7 +670,6 @@ def main():
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
     log(f'device={device}')
 
-    # environment + config dump (once per job)
     env_lines = [
         f'torch: {torch.__version__}',
         f'cuda: {torch.version.cuda}',
@@ -1143,9 +693,7 @@ def main():
 
     seg_pred_path = output_dir / 'results' / 'segment_predictions' / f'{job_id}.csv'
 
-    # Per-job, not one shared run_state.json: concurrent jobs read-modify-write the whole
-    # file, so a neighbour's save would silently drop another job's fold-completion records
-    # and folds would be re-run. Same separation the stats/ files already use.
+    # One state file per job: concurrent jobs would overwrite a shared one.
     state_path = output_dir / 'state' / f'run_state_{job_id}.json'
     state = load_json(state_path, {})
 

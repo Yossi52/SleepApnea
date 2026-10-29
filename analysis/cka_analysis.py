@@ -28,7 +28,7 @@ import json
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torchvision import transforms, models
+from torchvision import transforms
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -37,13 +37,11 @@ from tqdm import tqdm
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from scipy.stats import pearsonr, spearmanr
 
-# Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from src.models import build_model  # noqa: E402
 
 
-# ============================================================
-# 1. CKA Implementation
-# ============================================================
+# CKA Implementation
 
 def gram_linear(x):
     """Compute Gram matrix for linear kernel."""
@@ -126,9 +124,7 @@ def kernel_CKA(X, Y, threshold=None):
     return cka(gx, gy).item()
 
 
-# ============================================================
-# 2. Model & Feature Extraction
-# ============================================================
+# Model & Feature Extraction
 
 LAYER_INDICES = {
     'early': (0, 3),    # EfficientNet-B0 features[0:3]
@@ -137,16 +133,6 @@ LAYER_INDICES = {
 }
 
 
-def build_model(num_classes=2, pretrained=True):
-    """Build EfficientNet-B0 model."""
-    weights = 'IMAGENET1K_V1' if pretrained else None
-    model = models.efficientnet_b0(weights=weights)
-    in_features = model.classifier[1].in_features
-    model.classifier = torch.nn.Sequential(
-        torch.nn.Dropout(p=0.2),
-        torch.nn.Linear(in_features, num_classes),
-    )
-    return model
 
 
 def extract_layer_activations(model, x, layer_indices):
@@ -187,6 +173,7 @@ def find_checkpoint(method, model_dir, random_state, fold_num):
         Path to the checkpoint file, or None if not found.
     """
     patterns = [
+        f"10fold_{method}_single_rs{random_state}_fold{fold_num}.pt",  # experiments/train.py
         f"{method}, efficientnet_b0, rs:{random_state}, fold:{fold_num}, seg_drop: True ds: False, optim: AdamW, channel_weights: None, channel_order: None_train.pth",
         f"{method}, efficientnet_b0, rs:{random_state}, fold:{fold_num}, seg_drop: True ds: False, *_train.pth",
     ]
@@ -199,9 +186,7 @@ def find_checkpoint(method, model_dir, random_state, fold_num):
     return None
 
 
-# ============================================================
-# 3. Segment Matching
-# ============================================================
+# Segment Matching
 
 def get_matched_segments(base_dir, methods, random_state=128, fold_num=1,
                          patient_ids=None, segment_range=None, max_samples=None):
@@ -278,9 +263,7 @@ def get_matched_segments(base_dir, methods, random_state=128, fold_num=1,
     return matched
 
 
-# ============================================================
-# 4. Feature Normalization
-# ============================================================
+# Feature Normalization
 
 def normalize_features(f, norm_type='both'):
     """Normalize feature tensors before CKA computation.
@@ -299,9 +282,7 @@ def normalize_features(f, norm_type='both'):
     return f
 
 
-# ============================================================
-# 5. CKA Matrix Computation
-# ============================================================
+# CKA Matrix Computation
 
 def compute_cka_matrices(all_features, methods, cka_types, norm_type, device):
     """Compute CKA similarity matrices for all layer-method pairs.
@@ -347,9 +328,7 @@ def compute_cka_matrices(all_features, methods, cka_types, norm_type, device):
     return results
 
 
-# ============================================================
-# 6. Visualization
-# ============================================================
+# Visualization
 
 METHOD_LABELS = ['GADF', 'GASF', 'MTF', 'RP', 'Scalo', 'Spec']
 
@@ -522,9 +501,7 @@ def plot_layer_trend(cka_results, cka_type, methods, output_dir=None):
     plt.show()
 
 
-# ============================================================
-# 7. Robustness Analysis
-# ============================================================
+# Robustness Analysis
 
 def robustness_analysis(cka_results, methods):
     """Compare Linear and RBF CKA to assess robustness of findings."""
@@ -575,9 +552,7 @@ def robustness_analysis(cka_results, methods):
     print("=" * 70)
 
 
-# ============================================================
-# 8. Summary Statistics
-# ============================================================
+# Summary Statistics
 
 def print_summary(cka_results, cka_type, methods, all_labels):
     """Print analysis summary including off-diagonal stats and cluster analysis."""
@@ -623,9 +598,7 @@ def print_summary(cka_results, cka_type, methods, all_labels):
     return off_means
 
 
-# ============================================================
 # Main
-# ============================================================
 
 def parse_args():
     p = argparse.ArgumentParser(description='CKA Analysis for Image Fusion')
@@ -696,7 +669,7 @@ def main():
             continue
         print(f"  Checkpoint: {os.path.basename(ckpt)}")
 
-        model = build_model(num_classes=2, pretrained=False)
+        model = build_model('single', pretrained=False)
         model.load_state_dict(torch.load(ckpt, map_location=device))
         model.eval().to(device)
 

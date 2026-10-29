@@ -39,13 +39,10 @@ def median_filter(data, kernel_size=5):
 
 def apply_all_filters(data, fs=100):
     """Apply all preprocessing filters"""
-    # 45Hz low-pass filter
     data = lowpass_filter(data, cutoff=45, fs=fs)
     
-    # 0.5-10Hz bandpass filter
     data = bandpass_filter(data, lowcut=0.5, highcut=10, fs=fs)
     
-    # Median filter
     data = median_filter(data, kernel_size=5)
     
     return data
@@ -71,7 +68,6 @@ def load_apnea_labels(record_name, data_dir):
     """Load apnea annotations from Physionet"""
     annotation = wfdb.rdann(os.path.join(data_dir, record_name), 'apn')
     
-    # Convert annotations to minute-level labels
     # Annotations are in samples, need to convert to minutes
     labels_dict = {}
     for i, (sample, symbol) in enumerate(zip(annotation.sample, annotation.symbol)):
@@ -108,15 +104,12 @@ def segment_signal(signal_data, labels_dict, segment_length=60, fs=100, drop_bad
         
         segment = signal_data[start_sample:end_sample]
         
-        # Check segment length
         if len(segment) != segment_samples:
             continue
         
-        # Check segment quality
         if drop_bad_segments and not check_segment_quality(segment):
             continue
         
-        # Get label (default to 0 if not in labels_dict)
         label = labels_dict.get(minute, 0)
         
         segments.append((segment, label))
@@ -126,30 +119,25 @@ def segment_signal(signal_data, labels_dict, segment_length=60, fs=100, drop_bad
 
 def process_record(record_name, data_dir, output_dir, drop_bad_segments=True):
     """Process a single record"""
-    # Load signal
     record = wfdb.rdrecord(os.path.join(data_dir, record_name))
     
     # Assuming ECG is in the first channel
     ecg_signal = record.p_signal[:, 0]
     fs = record.fs
     
-    # Apply filters
     filtered_signal = apply_all_filters(ecg_signal, fs=fs)
     
-    # Load labels
     labels_dict = load_apnea_labels(record_name, data_dir)
     
-    # Segment signal
     segments = segment_signal(filtered_signal, labels_dict, segment_length=60, fs=fs, 
                             drop_bad_segments=drop_bad_segments)
     
-    # Save segments
     record_output_dir = os.path.join(output_dir, record_name)
     os.makedirs(record_output_dir, exist_ok=True)
     
     segment_info = []
     for i, (segment, label) in enumerate(segments):
-        segment_filename = f"{record_name}_seg{i:04d}_label{label}.npy"
+        segment_filename = f"{record_name}_segment{i:03d}_label{label}.npy"
         segment_path = os.path.join(record_output_dir, segment_filename)
         np.save(segment_path, segment)
         
@@ -160,7 +148,6 @@ def process_record(record_name, data_dir, output_dir, drop_bad_segments=True):
             'filename': segment_filename
         })
     
-    # Save segment info
     info_df = pd.DataFrame(segment_info)
     info_df.to_csv(os.path.join(record_output_dir, 'segment_info.csv'), index=False)
     
@@ -186,7 +173,6 @@ def main():
     print(f"Exclude c05: {args.exclude_c05}")
     print("=" * 80)
     
-    # Get list of records
     # Physionet naming: a01-a20, b01-b05, c01-c10, x01-x35
     records = []
     for prefix in ['a', 'b', 'c', 'x']:
@@ -199,11 +185,9 @@ def main():
         elif prefix == 'x':
             records.extend([f'{prefix}{i:02d}' for i in range(1, 36)])
     
-    # Exclude c05 if requested
     if args.exclude_c05:
         records = [r for r in records if r != 'c05']
     
-    # Filter records that exist in data directory
     existing_records = []
     for record in records:
         if os.path.exists(os.path.join(args.data_dir, f'{record}.dat')):

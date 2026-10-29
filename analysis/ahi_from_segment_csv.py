@@ -1,9 +1,7 @@
 """Recording-level AHI analysis from segment-prediction CSVs (Apnea-ECG withheld set x01-x35).
 
-No model loading, no inference. This script consumes the per-segment CSVs written by the
-patched `test_model()` in subject_wise_split.py / subject_wise_split_fusion_models.py
-(`*_test_segment_predictions.csv`), so the predictions are guaranteed to come from the
-exact preprocessing path used at training time.
+No model loading, no inference. Input is the per-segment CSV that experiments/train.py writes
+for every withheld run (`predictions/*_test_segment_predictions.csv`).
 
 Expected CSV columns:
     dataset_index, file_path, record_id, segment_index,
@@ -33,9 +31,7 @@ PRIOR_WORK_MAE_RANGE = (2.593, 2.71)
 REQUIRED_COLUMNS = ['record_id', 'y_true', 'y_pred']
 
 
-# ============================================================================
-# 1. Ground truth
-# ============================================================================
+# Ground truth
 
 def parse_test_dataset_annos(path):
     """test-dataset-annos.txt -> {record_id: per-minute 0/1 array}.
@@ -123,9 +119,7 @@ def build_ground_truth_table(annos, addinfo):
     return pd.DataFrame(rows).set_index('record'), discrepancies
 
 
-# ============================================================================
-# 2. Segment CSV loading
-# ============================================================================
+# Segment CSV loading
 
 def infer_model_type(name):
     low = os.path.basename(name).lower()
@@ -133,7 +127,7 @@ def infer_model_type(name):
         return 'hybrid'
     if 'late' in low:
         return 'late'
-    if 'fusion' in low:          # early fusion = single backbone over a 3-channel fused image
+    if 'early' in low or 'fusion' in low:
         return 'early'
     return 'single'
 
@@ -237,9 +231,7 @@ def segment_level_metrics(seg_df):
     return pd.DataFrame(rows)
 
 
-# ============================================================================
-# 3. Recording-level aggregation & metrics
-# ============================================================================
+# Recording-level aggregation & metrics
 
 def aggregate_recording_level(seg_df, gt_table):
     rows = []
@@ -324,9 +316,7 @@ def abc_class(ahi):
     return 'C'
 
 
-# ============================================================================
-# 4. Plots
-# ============================================================================
+# Plots
 
 def make_plots(df, x_col, y_col, label_col, title, out_prefix, out_dir):
     import matplotlib
@@ -370,9 +360,7 @@ def make_plots(df, x_col, y_col, label_col, title, out_prefix, out_dir):
     plt.close(fig)
 
 
-# ============================================================================
-# 5. Report
-# ============================================================================
+# Report
 
 def df_to_md(df):
     cols = [str(c) for c in df.columns]
@@ -469,9 +457,7 @@ def write_report(out_dir, gt_table, discrepancies, problems, seg_metrics, compar
     return path
 
 
-# ============================================================================
-# 6. Main
-# ============================================================================
+# Main
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,

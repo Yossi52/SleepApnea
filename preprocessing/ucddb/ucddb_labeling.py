@@ -65,7 +65,6 @@ def parse_respiratory_event_file(file_path):
     
     df = pd.DataFrame(parsed_data)
     
-    # Convert data types
     for col in ['Duration', 'Low']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
